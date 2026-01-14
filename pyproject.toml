@@ -1,0 +1,19 @@
+[project]
+name = "stt-vietsub-service"
+version = "0.1.0"
+description = "Realtime-ish Vietnamese STT service using faster-whisper"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.30.6",
+  "pydantic==2.10.4",
+  "python-multipart==0.0.20",
+  "aiohttp==3.10.10",
+  "numpy==2.1.3",
+  "faster-whisper==1.0.3",
+  "python-dotenv==1.0.1",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
