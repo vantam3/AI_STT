@@ -15,15 +15,15 @@ class CallbackClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         async with self._lock:
             if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=23))
+                self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
             return self._session
 
     def _iter_backoff(self) -> Iterable[float]:
-        for base in (0.5, 1.0, 2.0, 4.0, 8.0):
+        for base in (0.5, 1.0, 2.0, 4.0):
             jitter = random.uniform(0.8, 1.2)
             yield base * jitter
 
-    async def post(self, payload: Dict[str, Any]) -> None:
+    async def post(self, payload: Dict[str, Any]) -> bool:
         headers = {"Content-Type": "application/json"}
         if self.secret:
             headers["x-ai-key"] = self.secret
@@ -40,7 +40,7 @@ class CallbackClient:
                             payload.get("seq"),
                             resp.status,
                         )
-                        return
+                        return True
                     if resp.status not in (408, 429) and resp.status < 500:
                         logging.getLogger("stt").warning(
                             "webhook non-retryable status=%s session_id=%s seq=%s",
@@ -48,18 +48,19 @@ class CallbackClient:
                             payload.get("session_id"),
                             payload.get("seq"),
                         )
-                        return
+                        return False
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 pass
 
-            if attempt == 5:
+            if attempt == 4:
                 logging.getLogger("stt").error(
                     "webhook failed after retries session_id=%s seq=%s",
                     payload.get("session_id"),
                     payload.get("seq"),
                 )
-                return
+                return False
             await asyncio.sleep(delay)
+        return False
 
     async def close(self):
         if self._session and not self._session.closed:

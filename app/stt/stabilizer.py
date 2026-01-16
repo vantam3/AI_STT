@@ -40,6 +40,6 @@ class SimpleStabilizer:
         partial = new_text[len(self._stable):].lstrip() if self._stable else new_text
         return Stabilized(stable=self._stable, partial=partial)
 
-    def reset(self):
+    def reset(self) -> None:
         self._stable = ""
         self._prev = ""

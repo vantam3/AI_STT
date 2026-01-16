@@ -1,7 +1,8 @@
-﻿import asyncio
+import asyncio
 import logging
 import os
 import time
+import random
 import wave
 from typing import Optional, Callable, Awaitable
 
@@ -15,11 +16,10 @@ from app.stt.streaming.buffer import AudioBuffer
 from app.stt.streaming.gate import SpeechGate
 from app.stt.streaming.dedupe import TextDedupe
 from app.stt.streaming.agreement import LocalAgreement
-from app.stt.streaming.jitter import JitterBuffer
 
 
 class CaptionEvent(BaseModel):
-    type: str  # "partial" | "final" | "end"
+    type: str  # "partial" | "commit" | "final" | "end"
     live_id: str
     session_id: str
     utterance_id: int
@@ -29,6 +29,7 @@ class CaptionEvent(BaseModel):
     committed_until: Optional[float] = None
     stability_hits: Optional[int] = None
     replace: bool = False
+    end_of_turn: bool = False
     speaker: Optional[str] = None
     room_id: Optional[str] = None
     publisher_id: Optional[str] = None
@@ -50,10 +51,18 @@ class STTWorker:
         chunk_seconds: float,
         overlap_seconds: float,
         emit_interval_ms: int,
+        agreement_hits: int,
+        silence_seconds: float,
         device: str,
         compute_type: str,
         sem: asyncio.Semaphore,
         on_event: Callable[[CaptionEvent], Awaitable[None]],
+        window_min_seconds: Optional[float] = None,
+        window_max_seconds: Optional[float] = None,
+        emit_min_ms: Optional[int] = None,
+        emit_max_ms: Optional[int] = None,
+        silence_min_ms: Optional[int] = None,
+        silence_max_ms: Optional[int] = None,
     ):
         self.session_id = session_id
         self.live_id = live_id
@@ -69,6 +78,14 @@ class STTWorker:
         self.chunk_seconds = chunk_seconds
         self.overlap_seconds = overlap_seconds
         self.emit_interval_ms = emit_interval_ms
+        self.agreement_hits = agreement_hits
+        self.silence_seconds = silence_seconds
+        self.window_min_seconds = window_min_seconds
+        self.window_max_seconds = window_max_seconds
+        self.emit_min_ms = emit_min_ms
+        self.emit_max_ms = emit_max_ms
+        self.silence_min_ms = silence_min_ms
+        self.silence_max_ms = silence_max_ms
 
         self.device = device
         self.compute_type = compute_type
@@ -82,16 +99,16 @@ class STTWorker:
         self._final_flushed = False
         self._end_emitted = False
 
-        self._stabilizer = SimpleStabilizer(min_chars=18)
-
         self._sr = 16000
         self._bytes_per_sec = self._sr * 2  # mono int16
-        self._buffer = AudioBuffer(sample_rate=self._sr, max_seconds=6.0)
-        self._asr = FasterWhisperASR(self.model_size, self.device, self.compute_type, self.language or "vi")
+        max_seconds = float(os.getenv("STT_BUFFER_SECONDS", "2.3") or "2.3")
+        buffer_capacity = max_seconds * 5.0
+        self._buffer = AudioBuffer(sample_rate=self._sr, max_seconds=buffer_capacity)
         self._gate = SpeechGate(rms_threshold=0.005, min_speech_seconds=0.2, min_speech_ratio=0.2)
+        self._stabilizer = SimpleStabilizer(min_chars=18)
         self._dedupe = TextDedupe()
-        self._agreement = LocalAgreement(min_hits=3)
-        self._jitter = JitterBuffer(sample_rate=self._sr, frame_ms=20, target_delay_ms=40, max_delay_ms=120)
+        self._agreement = LocalAgreement(min_hits=agreement_hits)
+        self._asr = FasterWhisperASR(self.model_size, self.device, self.compute_type, self.language or "vi")
 
         self._audio_seconds_seen = 0.0
         self._seq = 0
@@ -99,25 +116,43 @@ class STTWorker:
         self._last_t1 = 0.0
         self._bytes_seen = 0
         self._last_bytes_log = 0.0
-        self._last_voice_ts = time.time()
         self._last_emit_t1 = -1.0
+        self._last_voice_ts = time.time()
+        self._ingest_bytes = 0
+        self._ingest_start = time.time()
+        self._buffer_seconds = max_seconds
+        self._partial_char_limit = 200
 
         self._utterance_id = 1
         self._current_committed_text = ""
-        self._committed_end_time = 0.0
         self._final_emitted_text = ""
+        # What we last showed to the client (committed + partial).
+        # We'll use the tail as prompt so the ASR behaves like sliding-window.
+        self._last_display_text = ""
         self._last_segments = None
-        self._keep_seconds = 0.8
+        self._end_sample = 0
+
+        self._last_rtf = 0.0
+        self._last_proc_ms = 0.0
+        self._last_overload_ts = 0.0
+
+        self._window_min_seconds = self._coalesce_window_min()
+        self._window_max_seconds = self._coalesce_window_max(self._window_min_seconds)
+        self._emit_min_ms, self._emit_max_ms = self._coalesce_emit_range()
+        self._silence_seconds = self._pick_silence_seconds()
+        self._emit_interval_ms_current = self._pick_emit_interval_ms()
+
+        self._lag_drop_seconds = float(os.getenv("STT_LAG_DROP_SECONDS", "2.5") or "2.5")
+        self._lag_keep_seconds = float(os.getenv("STT_LAG_KEEP_SECONDS", "1.4") or "1.4")
+        self._skip_windows = 0
+        self._last_ff_sample = 0
+        self._last_ff_ts = 0.0
+        self._playout_start = time.time()
+        self._playout_ref_sample = 0
 
         self._dump_bytes_left = 0
         self._dump_wave: Optional[wave.Wave_write] = None
         self._dump_path = ""
-        self._text_log_path = ""
-        self._text_log = None
-        self._asr_dump_bytes_left = 0
-        self._asr_dump_wave: Optional[wave.Wave_write] = None
-        self._asr_dump_path = ""
-        self._end_sample = 0
 
     async def start(self):
         if self.running:
@@ -135,7 +170,7 @@ class STTWorker:
         self._stop_event.set()
         if self._task:
             try:
-                await asyncio.wait_for(self._task, timeout=3.0)
+                await asyncio.wait_for(self._task, timeout=1.0)
             except asyncio.TimeoutError:
                 self._task.cancel()
                 try:
@@ -146,7 +181,15 @@ class STTWorker:
                 pass
         self._task = None
 
-    async def _emit(self, typ: str, text: str, t0: float, t1: float, replace: bool = False):
+    async def _emit(
+        self,
+        typ: str,
+        text: str,
+        t0: float,
+        t1: float,
+        replace: bool = False,
+        end_of_turn: bool = False,
+    ):
         self._seq += 1
         logging.getLogger("stt").info(
             "session %s emit %s seq=%s chars=%s text=%s",
@@ -164,18 +207,16 @@ class STTWorker:
             text=text,
             t_start=t0,
             t_end=t1,
-            committed_until=self._committed_end_time if typ in ("final", "end") else None,
+            committed_until=None,
             stability_hits=self._agreement.hits() if typ in ("partial", "final") else None,
             replace=replace,
+            end_of_turn=end_of_turn,
             speaker=None,
             room_id=self.room_id,
             publisher_id=self.publisher_id,
             seq=self._seq,
         )
         await self.on_event(evt)
-        if self._text_log is not None:
-            self._text_log.write(f"{typ}\t{self._seq}\t{self._utterance_id}\t{int(replace)}\t{text}\n")
-            self._text_log.flush()
 
     @staticmethod
     def _common_prefix_len(a: str, b: str) -> int:
@@ -185,210 +226,317 @@ class STTWorker:
             i += 1
         return i
 
-    def _commit(self, stable_text: str, segments, t0: float, keep_seconds: float) -> None:
-        if not stable_text:
+    def _reset_text_state(self) -> None:
+        self._stabilizer.reset()
+        self._dedupe.update("")
+        self._agreement.update("")
+        self._current_committed_text = ""
+        self._final_emitted_text = ""
+        self._last_display_text = ""
+
+    def _build_prompt(self) -> Optional[str]:
+        """Prompt used for streaming continuity.
+
+        We prefer the last displayed text (committed + partial) instead of only the
+        last final. This makes outputs connect across windows. We also cap length.
+        """
+        prompt_chars = int(os.getenv("STT_PROMPT_CHARS", "260") or "260")
+        txt = (self._last_display_text or self._final_emitted_text or "").strip()
+        if not txt:
+            return None
+        if len(txt) <= prompt_chars:
+            return txt
+        return txt[-prompt_chars:]
+
+    def _coalesce_window_min(self) -> float:
+        if self.window_min_seconds and self.window_min_seconds > 0:
+            return self.window_min_seconds
+        if self.chunk_seconds and self.chunk_seconds > 0:
+            return self.chunk_seconds
+        v = os.getenv("STT_WINDOW_MIN_SECONDS")
+        if v:
+            try:
+                return float(v)
+            except Exception:
+                pass
+        return 4.0
+
+    def _coalesce_window_max(self, min_seconds: float) -> float:
+        if self.window_max_seconds and self.window_max_seconds > 0:
+            return max(min_seconds, self.window_max_seconds)
+        if self.chunk_seconds and self.chunk_seconds > 0:
+            return max(min_seconds, self.chunk_seconds)
+        v = os.getenv("STT_WINDOW_MAX_SECONDS")
+        if v:
+            try:
+                return max(min_seconds, float(v))
+            except Exception:
+                pass
+        return max(min_seconds, 7.0)
+
+    def _coalesce_emit_range(self) -> tuple[int, int]:
+        if self.emit_min_ms and self.emit_min_ms > 0:
+            min_ms = int(self.emit_min_ms)
+        elif self.emit_interval_ms and self.emit_interval_ms > 0:
+            min_ms = int(self.emit_interval_ms)
+        else:
+            v = os.getenv("STT_EMIT_MIN_MS")
+            min_ms = int(float(v)) if v else 200
+
+        if self.emit_max_ms and self.emit_max_ms > 0:
+            max_ms = int(self.emit_max_ms)
+        elif self.emit_interval_ms and self.emit_interval_ms > 0:
+            max_ms = int(self.emit_interval_ms)
+        else:
+            v = os.getenv("STT_EMIT_MAX_MS")
+            max_ms = int(float(v)) if v else 400
+
+        if max_ms < min_ms:
+            max_ms = min_ms
+        return min_ms, max_ms
+
+    def _pick_window_seconds(self) -> float:
+        if self._window_max_seconds <= self._window_min_seconds:
+            return self._window_min_seconds
+        return random.uniform(self._window_min_seconds, self._window_max_seconds)
+
+    def _pick_emit_interval_ms(self) -> int:
+        if self._emit_max_ms <= self._emit_min_ms:
+            return self._emit_min_ms
+        return int(random.uniform(self._emit_min_ms, self._emit_max_ms))
+
+    def _pick_silence_seconds(self) -> float:
+        min_ms = int(self.silence_min_ms) if self.silence_min_ms and self.silence_min_ms > 0 else None
+        max_ms = int(self.silence_max_ms) if self.silence_max_ms and self.silence_max_ms > 0 else None
+        if min_ms is None:
+            if self.silence_seconds and self.silence_seconds > 0:
+                min_ms = int(self.silence_seconds * 1000.0)
+            else:
+                v = os.getenv("STT_SILENCE_MIN_MS")
+                min_ms = int(float(v)) if v else 500
+        if max_ms is None:
+            if self.silence_seconds and self.silence_seconds > 0:
+                max_ms = int(self.silence_seconds * 1000.0)
+            else:
+                v = os.getenv("STT_SILENCE_MAX_MS")
+                max_ms = int(float(v)) if v else 900
+        if max_ms < min_ms:
+            max_ms = min_ms
+        return random.uniform(min_ms, max_ms) / 1000.0
+
+    def _fast_forward_cursor(self, target_end_sample: int, reason: str, logger, extra: str = "") -> None:
+        if target_end_sample <= self._end_sample:
             return
-        prefix_len = self._common_prefix_len(self._current_committed_text, stable_text)
-        new_text = stable_text[prefix_len:].lstrip()
-        if not new_text:
+        now = time.time()
+        if now - self._last_ff_ts < 1.0 and target_end_sample - self._last_ff_sample < self._sr * 0.2:
             return
-        target_len = len(stable_text)
-        abs_end = None
-        acc = 0
-        for seg in segments or []:
-            seg_text = getattr(seg, "text", "")
-            acc += len(seg_text)
-            if acc >= target_len:
-                try:
-                    abs_end = t0 + float(seg.end)
-                except Exception:
-                    abs_end = None
-                break
-        if abs_end is None:
-            abs_end = t0
-        self._current_committed_text = stable_text
-        self._committed_end_time = max(self._committed_end_time, abs_end)
-        self._buffer.trim_to_time(self._committed_end_time, keep_seconds)
+        self._end_sample = target_end_sample
+        self._skip_windows = max(self._skip_windows, 2)
+        self._last_ff_sample = target_end_sample
+        self._last_ff_ts = now
+        logger.warning(
+            "session %s %s fast-forward cursor to %.2fs%s",
+            self.session_id,
+            reason,
+            self._end_sample / self._sr,
+            f" {extra}" if extra else "",
+        )
 
     async def _flush_final_once(self) -> None:
         if self._final_flushed:
             return
         self._final_flushed = True
-        st = self._stabilizer.update("")
-        if not st.stable:
+
+        # ưu tiên cái user đang thấy (committed + partial)
+        final_text = (self._last_display_text or "").strip()
+        if not final_text:
+            st = self._stabilizer.update("")
+            final_text = (st.stable or "").strip()
+
+        if not final_text or final_text == self._final_emitted_text:
             return
-        if st.stable == self._final_emitted_text:
-            return
-        await self._emit("final", st.stable, self._last_t0, self._last_t1)
-        self._commit(st.stable, self._last_segments, self._last_t0, self._keep_seconds)
-        self._final_emitted_text = st.stable
+
+        # flush phần còn lại thành commit
+        if final_text != self._current_committed_text:
+            new_text = final_text
+            if final_text.startswith(self._current_committed_text):
+                new_text = final_text[len(self._current_committed_text):]
+            new_text = new_text.lstrip(" \t\n?!.…,-:;")
+            if new_text:
+                await self._emit("commit", new_text, self._last_t0, self._last_t1, replace=False)
+
+        await self._emit("final", final_text, self._last_t0, self._last_t1, end_of_turn=True)
+
+        self._final_emitted_text = final_text
+        self._current_committed_text = final_text
+        self._last_display_text = final_text
         self._utterance_id += 1
-        self._current_committed_text = ""
+
+
+    def _compute_window(
+        self,
+        total_samples: int,
+        chunk_samples: int,
+        step_samples: int,
+        max_end_sample: Optional[int] = None,
+    ) -> Optional[tuple[bytes, int, float]]:
+        if chunk_samples <= 0 or step_samples <= 0:
+            return None
+        limit = max_end_sample if max_end_sample is not None else total_samples
+        if self._end_sample == 0:
+            if limit < chunk_samples:
+                return None
+            self._end_sample = chunk_samples
+        elif not self._buffer.ready(self._end_sample, step_samples):
+            return None
+        else:
+            self._end_sample += step_samples
+        if self._end_sample > limit:
+            return None
+        win = self._buffer.read_window(self._end_sample, chunk_samples)
+        if win is None:
+            return None
+        audio_bytes, win_start_sample = win
+        t1 = self._end_sample / self._sr
+        t0 = win_start_sample / self._sr
+        return audio_bytes, win_start_sample, t1
+
+    def _update_playout(self, now: float) -> float:
+        elapsed = max(0.0, now - self._playout_start)
+        playout_sample = self._playout_ref_sample + int(elapsed * self._sr)
+        return playout_sample / self._sr
 
     async def _run(self):
-        async with self.sem:
-            logger = logging.getLogger("stt")
-            self._bytes_seen = 0
-            self._last_bytes_log = time.time()
-            dump_full = os.getenv("STT_DUMP_FULL", "0") == "1"
-            dump_seconds = float(os.getenv("STT_DUMP_SECONDS", "0") or "0")
-            if dump_full or dump_seconds > 0:
-                self._dump_bytes_left = -1 if dump_full else int(dump_seconds * self._bytes_per_sec)
+        logger = logging.getLogger("stt")
+        last_emit = time.time()
+        self._playout_start = last_emit
+        self._playout_ref_sample = 0
+
+        try:
+            # optional audio dump
+            dump_seconds = float(os.getenv("STT_DUMP_SECONDS", "20") or "20")
+            if os.getenv("STT_DUMP_FULL", "0") == "1":
+                self._dump_bytes_left = int(dump_seconds * self._bytes_per_sec)
                 self._dump_path = f"stt_dump_{self.session_id}.wav"
                 self._dump_wave = wave.open(self._dump_path, "wb")
                 self._dump_wave.setnchannels(1)
                 self._dump_wave.setsampwidth(2)
                 self._dump_wave.setframerate(self._sr)
-                if dump_full:
-                    logger.info("session %s dump audio to %s (full)", self.session_id, self._dump_path)
-                else:
-                    logger.info("session %s dump audio to %s (%ss)", self.session_id, self._dump_path, dump_seconds)
-            if os.getenv("STT_DUMP_TEXT", "0") == "1":
-                self._text_log_path = f"stt_text_{self.session_id}.txt"
-                self._text_log = open(self._text_log_path, "w", encoding="utf-8")
-                logger.info("session %s dump text to %s", self.session_id, self._text_log_path)
-            asr_dump_full = os.getenv("STT_DUMP_ASR_FULL", "0") == "1"
-            asr_dump_seconds = float(os.getenv("STT_DUMP_ASR_SECONDS", "0") or "0")
-            if asr_dump_full or asr_dump_seconds > 0:
-                self._asr_dump_bytes_left = -1 if asr_dump_full else int(asr_dump_seconds * self._bytes_per_sec)
-                self._asr_dump_path = f"stt_asr_window_{self.session_id}.wav"
-                self._asr_dump_wave = wave.open(self._asr_dump_path, "wb")
-                self._asr_dump_wave.setnchannels(1)
-                self._asr_dump_wave.setsampwidth(2)
-                self._asr_dump_wave.setframerate(self._sr)
-                if asr_dump_full:
-                    logger.info("session %s dump asr window to %s (full)", self.session_id, self._asr_dump_path)
-                else:
-                    logger.info("session %s dump asr window to %s (%ss)", self.session_id, self._asr_dump_path, asr_dump_seconds)
-            if self.input_cfg.type == "janus_rtp_opus":
-                logger.info(
-                    "session %s start: janus_rtp_opus audio_port=%s payload_type=%s room_id=%s publisher_id=%s",
-                    self.session_id,
-                    self.input_cfg.audio_port,
-                    self.input_cfg.payload_type,
-                    self.room_id,
-                    self.publisher_id,
-                )
-            else:
-                logger.info(
-                    "session %s start: ffmpeg_url url=%s room_id=%s publisher_id=%s",
-                    self.session_id,
-                    self.input_cfg.url,
-                    self.room_id,
-                    self.publisher_id,
-                )
+                logger.info("session %s dump audio to %s (%.1fs)", self.session_id, self._dump_path, dump_seconds)
 
-            last_emit = 0.0
-            self._keep_seconds = float(os.getenv("STT_COMMIT_KEEP_SECONDS", "0.8") or "0.8")
-
-            try:
-                logger.info("session %s start ffmpeg reader", self.session_id)
-                async for pcm in pcm_stream_from_ffmpeg(self.input_cfg, stop_event=self._stop_event):
-                    if not self.running:
+            async with self.sem:
+                async for pcm_bytes in pcm_stream_from_ffmpeg(self.input_cfg, stop_event=self._stop_event):
+                    if self._stop_event.is_set() or self._stop_requested:
                         break
+                    if not pcm_bytes:
+                        await asyncio.sleep(0)
+                        continue
 
-                    if self._dump_wave is not None and self._dump_bytes_left != 0:
-                        if self._dump_bytes_left < 0:
-                            self._dump_wave.writeframes(pcm)
-                        else:
-                            take = min(len(pcm), self._dump_bytes_left)
-                            if take > 0:
-                                self._dump_wave.writeframes(pcm[:take])
-                                self._dump_bytes_left -= take
-                                if self._dump_bytes_left == 0:
+                    self._buffer.append_pcm16(pcm_bytes)
+                    self._bytes_seen += len(pcm_bytes)
+                    self._ingest_bytes += len(pcm_bytes)
+
+                    if self._dump_wave is not None and self._dump_bytes_left > 0:
+                        take = min(self._dump_bytes_left, len(pcm_bytes))
+                        if take > 0:
+                            self._dump_wave.writeframes(pcm_bytes[:take])
+                            self._dump_bytes_left -= take
+                            if self._dump_bytes_left <= 0:
+                                try:
                                     self._dump_wave.close()
+                                finally:
                                     self._dump_wave = None
-                                    logger.info("session %s dump done %s", self.session_id, self._dump_path)
-
-                    frames = self._jitter.add(pcm)
-                    for frame in frames:
-                        self._buffer.append(frame)
-                        self._audio_seconds_seen += len(frame) / self._bytes_per_sec
-                        self._bytes_seen += len(frame)
-
-                    now_ts = time.time()
-                    if now_ts - self._last_bytes_log >= 5.0:
-                        kbps = (self._bytes_seen * 8.0) / max(1.0, (now_ts - self._last_bytes_log)) / 1000.0
-                        logger.info(
-                            "session %s received audio bytes=%s (~%.1f kbps)",
-                            self.session_id,
-                            self._bytes_seen,
-                            kbps,
-                        )
-                        self._bytes_seen = 0
-                        self._last_bytes_log = now_ts
+                                logger.info("session %s finished dumping audio to %s", self.session_id, self._dump_path)
 
                     now = time.time()
-                    if (now - last_emit) * 1000.0 < self.emit_interval_ms:
-                        continue
-
-                    if not self._buffer.ready(self._end_sample, self.chunk_seconds):
-                        continue
-
-                    chunk_samples = int(self.chunk_seconds * self._sr)
-                    end_sample = self._end_sample + chunk_samples
-                    if end_sample > self._buffer.total_samples():
-                        continue
-                    window = self._buffer.window_for_end(end_sample)
-                    self._end_sample = end_sample
-
-                    burst_sec = float(os.getenv("STT_BURST_CHECK_SECONDS", "0.5") or "0.5")
-                    burst_corr = float(os.getenv("STT_BURST_CORR_THRESHOLD", "0.995") or "0.995")
-                    if burst_sec > 0:
-                        burst_samples = int(burst_sec * self._sr)
-                        if len(window) >= burst_samples * 2 * 2:
-                            audio_i16 = np.frombuffer(window, dtype=np.int16)
-                            tail = audio_i16[-burst_samples:]
-                            prev = audio_i16[-2 * burst_samples:-burst_samples]
-                            tail = tail - tail.mean()
-                            prev = prev - prev.mean()
-                            denom = (np.linalg.norm(tail) * np.linalg.norm(prev)) + 1e-6
-                            corr = float(np.dot(tail, prev) / denom)
-                            if corr >= burst_corr:
-                                logger.info("session %s drop repeated burst corr=%.3f", self.session_id, corr)
-                                last_emit = now
-                                continue
-
-                    if self._asr_dump_wave is not None and self._asr_dump_bytes_left != 0:
-                        if self._asr_dump_bytes_left < 0:
-                            self._asr_dump_wave.writeframes(window)
-                        else:
-                            take = min(len(window), self._asr_dump_bytes_left)
-                            if take > 0:
-                                self._asr_dump_wave.writeframes(window[:take])
-                                self._asr_dump_bytes_left -= take
-                                if self._asr_dump_bytes_left == 0:
-                                    self._asr_dump_wave.close()
-                                    self._asr_dump_wave = None
-                                    logger.info("session %s asr window dump done %s", self.session_id, self._asr_dump_path)
-
-                    audio_i16 = np.frombuffer(window, dtype=np.int16)
-                    audio = (audio_i16.astype(np.float32) / 32768.0)
-                    if not self._gate.should_transcribe(audio):
-                        continue
-
-                    t_proc0 = time.time()
-                    segments, info = self._asr.transcribe(audio, self.vad_filter, self.beam_size)
-                    t_proc = time.time() - t_proc0
-                    audio_seconds = max(0.001, len(window) / self._bytes_per_sec)
-                    rtf = t_proc / audio_seconds
-                    logger.info("session %s rtf=%.2f proc=%.3fs audio=%.3fs", self.session_id, rtf, t_proc, audio_seconds)
-                    self._last_segments = segments
-
-                    text = ""
-                    speech_seconds = 0.0
-                    t0 = max(0.0, self._audio_seconds_seen - (len(window) / self._bytes_per_sec))
-                    t1 = self._audio_seconds_seen
-
-                    for seg in segments:
-                        text += seg.text
+                    if now - last_emit < (self._emit_interval_ms_current / 1000.0):
+                        remaining = (self._emit_interval_ms_current / 1000.0) - (now - last_emit)
                         try:
+                            await asyncio.wait_for(self._stop_event.wait(), timeout=max(0.0, remaining))
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    total_samples = self._buffer.total_samples()
+
+                    playout_t = self._update_playout(now)
+                    raw_latest_t = total_samples / self._sr
+                    lag_sec = raw_latest_t - playout_t
+                    if lag_sec > self._lag_drop_seconds:
+                        target = int(max(0.0, (raw_latest_t - self._lag_keep_seconds)) * self._sr)
+                        ingest_elapsed = max(1e-6, now - self._ingest_start)
+                        ingest_rtf = (self._ingest_bytes / self._bytes_per_sec) / ingest_elapsed
+                        self._fast_forward_cursor(
+                            target_end_sample=target,
+                            reason="burst ingest_rtf=%.2f" % ingest_rtf,
+                            logger=logger,
+                            extra="reset playout to %.2fs (keep=%.2fs)" % (raw_latest_t - self._lag_keep_seconds, self._lag_keep_seconds),
+                        )
+                        self._playout_start = now
+                        self._playout_ref_sample = target
+
+                    if self._skip_windows > 0:
+                        self._skip_windows -= 1
+                        last_emit = now
+                        continue
+
+                    window_seconds = self._pick_window_seconds()
+                    step_seconds = max(0.05, self._emit_interval_ms_current / 1000.0)
+                    if step_seconds >= window_seconds:
+                        step_seconds = max(0.05, window_seconds * 0.25)
+                    chunk_samples = int(window_seconds * self._sr)
+                    step_samples = max(1, int(step_seconds * self._sr))
+                    win = self._compute_window(total_samples, chunk_samples, step_samples)
+                    if win is None:
+                        last_emit = now
+                        continue
+                    audio_bytes, win_start_sample, t1 = win
+                    window_seconds = len(audio_bytes) / self._bytes_per_sec
+                    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    if not self._gate.should_transcribe(audio):
+                        last_emit = now
+                        continue
+
+                    t0 = win_start_sample / self._sr
+                    self._last_t0 = t0
+                    self._last_t1 = t1
+
+                    prompt = self._build_prompt()
+                    start_ts = time.time()
+                    segments, info = self._asr.transcribe(audio, self.vad_filter, self.beam_size, prompt=prompt)
+                    proc_s = time.time() - start_ts
+                    self._last_rtf = (proc_s / max(1e-6, window_seconds))
+                    self._last_proc_ms = proc_s * 1000.0
+
+                    seg_texts = []
+                    seg_starts = []
+                    seg_ends = []
+                    speech_seconds = 0.0
+                    for seg in segments:
+                        seg_texts.append(seg.text)
+                        try:
+                            seg_starts.append(float(seg.start))
+                            seg_ends.append(float(seg.end))
                             speech_seconds += max(0.0, float(seg.end) - float(seg.start))
                         except Exception:
                             pass
+                    text = "".join(seg_texts).strip()
+                    if seg_starts and seg_ends:
+                        rel_start = max(0.0, min(seg_starts))
+                        rel_end = max(seg_ends)
+                        t0 = max(0.0, t1 - window_seconds + rel_start)
+                        t1 = max(t0, t1 - window_seconds + rel_end)
+                    if speech_seconds > 0.0:
+                        self._last_voice_ts = now
 
-                    text = text.strip()
-                    window_seconds = max(0.001, len(window) / self._bytes_per_sec)
+                    logger.info(
+                        "session %s rtf=%.2f proc=%.3fs audio=%.3fs",
+                        self.session_id,
+                        self._last_rtf,
+                        proc_s,
+                        window_seconds,
+                    )
+
                     if not self._gate.should_emit(speech_seconds, window_seconds):
                         last_emit = now
                         continue
@@ -397,13 +545,25 @@ class STTWorker:
                         continue
 
                     st = self._stabilizer.update(text)
-                    full_text = (st.stable + (" " if st.stable and st.partial else "") + st.partial).strip()
+                    full_text = (self._current_committed_text + (" " if self._current_committed_text and st.partial else "") + st.partial).strip()
+                    if len(full_text) > self._partial_char_limit:
+                        full_text = full_text[: self._partial_char_limit]
                     prefix_len = self._common_prefix_len(self._current_committed_text, full_text)
                     merged_partial = full_text[prefix_len:].lstrip()
                     if not merged_partial:
                         last_emit = now
                         continue
-                    if self._dedupe.is_repetitive(merged_partial) or self._dedupe.is_duplicate(merged_partial):
+
+                    if self._dedupe.is_repetitive(merged_partial):
+                        # If the model starts looping, reset streaming prompt/stabilizer so it can recover.
+                        logger.warning("session %s repetitive output detected; resetting prompt", self.session_id)
+                        self._last_display_text = self._final_emitted_text
+                        self._stabilizer.reset()
+                        self._agreement.update("")
+                        self._dedupe.update("")
+                        last_emit = now
+                        continue
+                    if self._dedupe.is_duplicate(merged_partial):
                         last_emit = now
                         continue
 
@@ -413,51 +573,80 @@ class STTWorker:
                     self._last_emit_t1 = t1
                     self._last_t0 = t0
                     self._last_t1 = t1
-                    self._last_voice_ts = now
+
                     self._agreement.update(st.stable)
                     await self._emit("partial", full_text, t0, t1, replace=True)
+                    self._last_display_text = full_text
                     self._dedupe.update(merged_partial)
 
-                    keep_seconds = self._keep_seconds
-                    if self._agreement.should_emit_final(st.stable) and st.stable != self._final_emitted_text:
-                        await self._emit("final", st.stable, t0, t1)
-                        self._commit(st.stable, segments, t0, keep_seconds)
-                        self._final_emitted_text = st.stable
+                    if self._agreement.should_emit_final(st.stable) and st.stable != self._current_committed_text:
+                        new_text = st.stable
+                        if st.stable.startswith(self._current_committed_text):
+                            new_text = st.stable[len(self._current_committed_text):]
+                        new_text = new_text.lstrip(" \t\n?!.…,-:;")
+                        if new_text:
+                            await self._emit("commit", new_text, t0, t1, replace=False)
+
+                        self._current_committed_text = st.stable
+                        self._last_display_text = st.stable + ((" " + st.partial) if st.partial else "")
+
+
+                    if (now - self._last_voice_ts) >= self._silence_seconds and full_text and full_text != self._final_emitted_text:
+                        final_text = full_text.strip()
+
+                        # flush phần còn lại thành commit
+                        if final_text != self._current_committed_text:
+                            new_text = final_text
+                            if final_text.startswith(self._current_committed_text):
+                                new_text = final_text[len(self._current_committed_text):]
+                            new_text = new_text.lstrip(" \t\n?!.…,-:;")
+                            if new_text:
+                                await self._emit("commit", new_text, t0, t1, replace=False)
+
+                        await self._emit("final", final_text, t0, t1, end_of_turn=True)
+
+                        self._final_emitted_text = final_text
+                        self._current_committed_text = final_text
+                        self._last_display_text = final_text
                         self._utterance_id += 1
-                        self._current_committed_text = ""
+
+                        self._stabilizer.reset()
+                        self._agreement.update("")
+                        self._dedupe.update("")
+                        self._silence_seconds = self._pick_silence_seconds()
+
 
                     last_emit = now
-
-                    if (now - self._last_voice_ts) >= 0.7 and st.stable and st.stable != self._final_emitted_text:
-                        await self._emit("final", st.stable, t0, t1)
-                        self._commit(st.stable, segments, t0, keep_seconds)
-                        self._final_emitted_text = st.stable
-                        self._utterance_id += 1
-                        self._current_committed_text = ""
+                    self._emit_interval_ms_current = self._pick_emit_interval_ms()
 
                 if self._stop_requested:
                     await self._flush_final_once()
-                    await self._emit("end", "", self._last_t0, self._last_t1)
-                    self._end_emitted = True
                 else:
                     st = self._stabilizer.update("")
-                    if st.stable:
-                        await self._emit("final", st.stable, self._last_t0, self._last_t1)
-                        self._commit(st.stable, self._last_segments, self._last_t0, self._keep_seconds)
+                    final_text = (self._last_display_text or st.stable or "").strip()
+                    if final_text and final_text != self._final_emitted_text:
+                        if final_text != self._current_committed_text:
+                            new_text = final_text
+                            if final_text.startswith(self._current_committed_text):
+                                new_text = final_text[len(self._current_committed_text):]
+                            new_text = new_text.lstrip(" \t\n?!.…,-:;")
+                            if new_text:
+                                await self._emit("commit", new_text, self._last_t0, self._last_t1, replace=False)
+
+                        await self._emit("final", final_text, self._last_t0, self._last_t1, end_of_turn=True)
+                        self._final_emitted_text = final_text
+                        self._current_committed_text = final_text
+                        self._last_display_text = final_text
                         self._utterance_id += 1
-                        self._current_committed_text = ""
-            except Exception:
-                return
-            finally:
-                if self._stop_requested and not self._end_emitted:
-                    await self._flush_final_once()
-                    await self._emit("end", "", self._last_t0, self._last_t1)
-                    self._end_emitted = True
-                self.running = False
-                if self._dump_wave is not None:
-                    self._dump_wave.close()
-                if self._text_log is not None:
-                    self._text_log.close()
-                if self._asr_dump_wave is not None:
-                    self._asr_dump_wave.close()
-                logger.info("session %s end", self.session_id)
+
+        except Exception:
+            logger.exception("session %s worker failed", self.session_id)
+        finally:
+            if not self._end_emitted:
+                await self._flush_final_once()
+                await self._emit("end", "", self._last_t0, self._last_t1)
+                self._end_emitted = True
+            self.running = False
+            if self._dump_wave is not None:
+                self._dump_wave.close()
+            logger.info("session %s end", self.session_id)

@@ -3,7 +3,6 @@ class AudioBuffer:
         self.sample_rate = sample_rate
         self.bytes_per_sec = sample_rate * 2
         self.max_bytes = int(max_seconds * self.bytes_per_sec)
-        self.max_seconds = max_seconds
         self._buf = bytearray()
         self._start_sample = 0
         self._total_samples = 0
@@ -18,30 +17,39 @@ class AudioBuffer:
             self._buf = self._buf[trim:]
             self._start_sample += trim // 2
 
+    def append_pcm16(self, pcm: bytes) -> None:
+        self.append(pcm)
+
     def total_samples(self) -> int:
         return self._total_samples
 
-    def ready(self, end_sample: int, chunk_seconds: float) -> bool:
-        need = int(chunk_seconds * self.sample_rate)
-        return self._total_samples - end_sample >= need
+    def start_sample(self) -> int:
+        return self._start_sample
 
-    def window_for_end(self, end_sample: int) -> bytes:
-        window_samples = int(self.max_seconds * self.sample_rate)
+    def ready(self, end_sample: int, step_samples: int) -> bool:
+        return self._total_samples - end_sample >= step_samples
+
+    def read_window(self, end_sample: int, window_samples: int) -> tuple[bytes, int] | None:
         start_sample = max(self._start_sample, end_sample - window_samples)
+        if end_sample <= start_sample:
+            return None
         start_offset = max(0, start_sample - self._start_sample)
         end_offset = max(0, end_sample - self._start_sample)
         start_byte = start_offset * 2
         end_byte = end_offset * 2
-        return bytes(self._buf[start_byte:end_byte])
+        if end_byte > len(self._buf):
+            return None
+        return bytes(self._buf[start_byte:end_byte]), start_sample
 
-    def trim_to_time(self, end_time: float, keep_seconds: float) -> None:
-        target_time = max(0.0, end_time - keep_seconds)
-        target_sample = int(target_time * self.sample_rate)
-        if target_sample <= self._start_sample:
+    def trim_to_last_seconds(self, keep_seconds: float) -> None:
+        keep_seconds = max(0.0, keep_seconds)
+        keep_bytes = int(keep_seconds * self.bytes_per_sec)
+        if keep_bytes <= 0:
+            self._start_sample += len(self._buf) // 2
+            self._buf = bytearray()
             return
-        drop_samples = min(target_sample - self._start_sample, len(self._buf) // 2)
-        if drop_samples <= 0:
+        if len(self._buf) <= keep_bytes:
             return
-        drop_bytes = drop_samples * 2
+        drop_bytes = len(self._buf) - keep_bytes
         self._buf = self._buf[drop_bytes:]
-        self._start_sample += drop_samples
+        self._start_sample += drop_bytes // 2

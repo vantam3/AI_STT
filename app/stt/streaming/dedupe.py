@@ -1,6 +1,8 @@
 class TextDedupe:
     def __init__(self):
         self._last_emitted_norm = ""
+        self._last_bigram = None
+        self._bigram_hits = 0
 
     @staticmethod
     def _norm(text: str) -> str:
@@ -25,6 +27,14 @@ class TextDedupe:
         words = self._norm(text).split()
         if len(words) < 4:
             return False
+        bigram = (words[-2], words[-1])
+        if self._last_bigram == bigram:
+            self._bigram_hits += 1
+        else:
+            self._bigram_hits = 1
+            self._last_bigram = bigram
+        if self._bigram_hits >= 4:
+            return True
         run = 1
         for i in range(1, len(words)):
             if words[i] == words[i - 1]:

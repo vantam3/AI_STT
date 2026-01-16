@@ -1,1 +1,1 @@
-# Package marker for streaming components.
+"""Streaming primitives for realtime audio pipeline."""
