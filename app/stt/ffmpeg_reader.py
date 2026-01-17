@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
-from app.stt.streaming.jitter import JitterBuffer
-
 
 @dataclass
 class FFMpegSource:
@@ -36,6 +34,9 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
     rtbuf_size = os.getenv("FFMPEG_RTBUF_SIZE")
     buffer_size = os.getenv("FFMPEG_BUFFER_SIZE")
 
+    # ✅ key fix: bù silence để giữ realtime timeline
+    async_filter = "aresample=async=1:first_pts=0"
+
     if input_cfg.type == "janus_rtp_opus":
         sdp = _sdp_for_opus(input_cfg.listen_ip, input_cfg.audio_port, input_cfg.payload_type)
         cmd = [
@@ -59,6 +60,8 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
             "1",
             "-ar",
             "16000",
+            "-af",
+            async_filter,          # ✅ add dòng này
             "-f",
             "s16le",
             "pipe:1",
@@ -88,6 +91,8 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
             "1",
             "-ar",
             "16000",
+            "-af",
+            async_filter,          # ✅ add dòng này
             "-f",
             "s16le",
             "pipe:1",
@@ -131,20 +136,14 @@ async def pcm_stream_from_ffmpeg(
             logger.warning("ffmpeg stderr: %s", line.decode(errors="ignore").strip())
 
     stderr_task = asyncio.create_task(_stderr_logger())
+
     last_no_data = 0.0
     last_data_ts = time.time()
     read_timeout = float(os.getenv("STT_FFMPEG_READ_TIMEOUT", "0.5") or "0.5")
-    idle_timeout = float(os.getenv("STT_RTP_IDLE_MS", "500") or "500") / 1000.0
+    idle_timeout = float(os.getenv("STT_RTP_IDLE_MS", "0") or "0") / 1000.0
 
-    # 20ms frame @16k mono s16le
-    frame_bytes = int(16000 * 2 * 0.02)
+    frame_bytes = 640  # 20ms @16k mono s16le
     pending = bytearray()
-
-    # Optional jitter for RTP/Janus (helps duplicate/drop)
-    jitter_enable = os.getenv("STT_JITTER_ENABLE", "1" if input_cfg.type == "janus_rtp_opus" else "0") == "1"
-    jitter_target = int(os.getenv("STT_JITTER_TARGET_MS", "80") or "80")
-    jitter_max = int(os.getenv("STT_JITTER_MAX_MS", "240") or "240")
-    jb = JitterBuffer(sample_rate=16000, frame_ms=20, target_delay_ms=jitter_target, max_delay_ms=jitter_max) if jitter_enable else None
 
     try:
         while True:
@@ -159,6 +158,9 @@ async def pcm_stream_from_ffmpeg(
                 timeout=read_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if stop_task and stop_task not in done:
+                stop_task.cancel()
 
             if stop_task and stop_task in done:
                 read_task.cancel()
@@ -180,23 +182,13 @@ async def pcm_stream_from_ffmpeg(
                 break
             last_data_ts = time.time()
 
-            if jb is None:
-                # normal path: yield fixed 20ms blocks
-                pending.extend(chunk)
-                while len(pending) >= frame_bytes:
-                    out = bytes(pending[:frame_bytes])
-                    del pending[:frame_bytes]
-                    yield out
-            else:
-                # jitter path: feed jb, yield drained frames
-                for out in jb.add(chunk):
-                    yield out
+            pending.extend(chunk)
+            while len(pending) >= frame_bytes:
+                out = bytes(pending[:frame_bytes])
+                del pending[:frame_bytes]
+                yield out
 
     finally:
-        if jb is not None:
-            total, dup, old = jb.stats()
-            logger.info("jitter stats total_frames=%s dup_dropped=%s old_dropped=%s", total, dup, old)
-
         if proc.returncode is None:
             proc.terminate()
             try:

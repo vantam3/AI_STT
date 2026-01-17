@@ -31,19 +31,13 @@ InputConfig = InputJRTPOpus | InputFFmpegURL
 class ASRConfig(BaseModel):
     model_size: Optional[str] = "small"
     language: Optional[str] = "vi"
-    vad_filter: bool = True
+    vad_filter: bool = False
     beam_size: int = 2
-    chunk_seconds: float = 4
-    overlap_seconds: float = 1
+    window_seconds: float = 1.2
+    overlap_seconds: float = 0.6
     emit_interval_ms: int = 300
     agreement_hits: int = 2
-    silence_seconds: float = 0.0
-    window_min_seconds: float = 1
-    window_max_seconds: float = 1
-    emit_min_ms: int = 200
-    emit_max_ms: int = 400
-    silence_min_ms: int = 700
-    silence_max_ms: int = 1200
+    silence_seconds: float = 1.0
 
 
 class CallbackConfig(BaseModel):
@@ -228,17 +222,11 @@ class SessionManager:
                 language=req.asr.language or "vi",
                 vad_filter=req.asr.vad_filter,
                 beam_size=req.asr.beam_size,
-                chunk_seconds=req.asr.chunk_seconds,
+                window_seconds=req.asr.window_seconds,
                 overlap_seconds=req.asr.overlap_seconds,
                 emit_interval_ms=req.asr.emit_interval_ms,
                 agreement_hits=req.asr.agreement_hits,
                 silence_seconds=req.asr.silence_seconds,
-                window_min_seconds=req.asr.window_min_seconds,
-                window_max_seconds=req.asr.window_max_seconds,
-                emit_min_ms=req.asr.emit_min_ms,
-                emit_max_ms=req.asr.emit_max_ms,
-                silence_min_ms=req.asr.silence_min_ms,
-                silence_max_ms=req.asr.silence_max_ms,
                 device=self.device,
                 compute_type=self.compute_type,
                 sem=self._sem,
