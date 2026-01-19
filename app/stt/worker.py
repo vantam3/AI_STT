@@ -67,10 +67,10 @@ class STTWorker:
         self.language = language
         self.vad_filter = vad_filter
 
-        # ✅ IMPORTANT: beam_size realtime CPU nên = 1
+  
         self.beam_size = int(os.getenv("STT_BEAM_SIZE", str(beam_size or 1)) or "1")
 
-        # ✅ giữ param để fallback, nhưng env sẽ override trước
+
         self.window_seconds = window_seconds
         self.overlap_seconds = overlap_seconds
         self.emit_interval_ms = emit_interval_ms
@@ -129,7 +129,7 @@ class STTWorker:
         self._last_rtf = 0.0
         self._last_proc_ms = 0.0
 
-        # ✅ ENV override trước (quan trọng)
+
         self._window_seconds = self._coalesce_window_seconds()
         self._emit_interval_ms = self._coalesce_emit_interval_ms()
         self._overlap_seconds = self._coalesce_overlap_seconds(self._window_seconds, self._emit_interval_ms)
@@ -145,11 +145,11 @@ class STTWorker:
         self._playout_ref_sample = 0
         self._prompt_cooldown = 0
 
-        # dump wav (FULL only)
+
         self._dump_wave: Optional[wave.Wave_write] = None
         self._dump_path = ""
 
-        # lock ingest/process
+
         self._buf_lock = asyncio.Lock()
 
     async def start(self):
@@ -225,7 +225,6 @@ class STTWorker:
         return i
 
     def _build_prompt(self) -> Optional[str]:
-        # ✅ chỉ dùng committed (ổn định), không kéo partial
         prompt_chars = int(os.getenv("STT_PROMPT_CHARS", "240") or "240")
         if self._prompt_cooldown > 0:
             return None
@@ -234,7 +233,6 @@ class STTWorker:
             return None
         return txt[-prompt_chars:] if len(txt) > prompt_chars else txt
 
-    # ✅ ENV ưu tiên trước param init
     def _coalesce_window_seconds(self) -> float:
         v = os.getenv("STT_WINDOW_SECONDS")
         if v:

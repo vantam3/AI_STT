@@ -34,7 +34,6 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
     rtbuf_size = os.getenv("FFMPEG_RTBUF_SIZE")
     buffer_size = os.getenv("FFMPEG_BUFFER_SIZE")
 
-    # ✅ key fix: bù silence để giữ realtime timeline
     async_filter = "aresample=async=1:first_pts=0"
 
     if input_cfg.type == "janus_rtp_opus":
@@ -61,7 +60,7 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
             "-ar",
             "16000",
             "-af",
-            async_filter,          # ✅ add dòng này
+            async_filter,          
             "-f",
             "s16le",
             "pipe:1",
@@ -92,7 +91,7 @@ def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
             "-ar",
             "16000",
             "-af",
-            async_filter,          # ✅ add dòng này
+            async_filter,          
             "-f",
             "s16le",
             "pipe:1",

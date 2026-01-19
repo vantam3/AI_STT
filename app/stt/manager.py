@@ -75,6 +75,7 @@ class SessionManager:
         self._cb_fail_total = 0
         self._cb_last_log_ts = 0.0
         self._stopping_sessions: set[str] = set()
+        self._transcripts: Dict[str, Dict[str, Any]] = {}
 
     async def _ensure_callback_worker(self) -> None:
         if self._callback_task and not self._callback_task.done():
@@ -234,6 +235,7 @@ class SessionManager:
             )
             self._sessions[session_id] = worker
             self._subscribers[session_id] = []
+            self._transcripts[session_id] = {"text": "", "segments": [], "ended": False}
 
             await worker.start()
             return session_id
@@ -248,6 +250,9 @@ class SessionManager:
             await worker.stop()
             self._sessions.pop(session_id, None)
             self._subscribers.pop(session_id, None)
+            transcript = self._transcripts.get(session_id)
+            if transcript:
+                transcript["ended"] = True
             cb = self._callback_clients.pop(session_id, None)
             if cb:
                 await self._drop_callback_payloads(session_id)
@@ -285,6 +290,17 @@ class SessionManager:
             ],
         }
 
+    def get_transcript(self, session_id: str) -> Optional[Dict[str, Any]]:
+        transcript = self._transcripts.get(session_id)
+        if not transcript:
+            return None
+        return {
+            "session_id": session_id,
+            "text": transcript["text"],
+            "segments": list(transcript["segments"]),
+            "ended": bool(transcript.get("ended")),
+        }
+
     async def shutdown(self) -> None:
         async with self._lock:
             for sid, worker in list(self._sessions.items()):
@@ -294,6 +310,7 @@ class SessionManager:
                     logging.getLogger("stt").exception("failed to stop worker on shutdown sid=%s", sid)
             self._sessions.clear()
             self._subscribers.clear()
+            self._transcripts.clear()
             for cb in list(self._callback_clients.values()):
                 try:
                     await cb.close()
@@ -325,8 +342,28 @@ class SessionManager:
         except ValueError:
             pass
 
+    def _append_transcript(self, session_id: str, evt: CaptionEvent) -> None:
+        transcript = self._transcripts.get(session_id)
+        if not transcript:
+            return
+        text = evt.text or ""
+        if not text:
+            return
+        transcript["text"] += text
+        transcript["segments"].append(
+            {
+                "seq": evt.seq,
+                "utterance_id": evt.utterance_id,
+                "start_ms": int(evt.t_start * 1000),
+                "end_ms": int(evt.t_end * 1000),
+                "text": text,
+            }
+        )
+
     def _on_event_factory(self, session_id: str, callback_client: Optional[CallbackClient]):
         async def on_event(evt: CaptionEvent):
+            if evt.type == "commit":
+                self._append_transcript(session_id, evt)
             msg = evt.model_dump()
             for q in list(self._subscribers.get(session_id, [])):
                 try:

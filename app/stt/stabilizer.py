@@ -13,7 +13,6 @@ def _trim_to_word_boundary(s: str) -> str:
     s = s.strip()
     if not s:
         return ""
-    # cắt về ranh giới từ cuối cùng để tránh commit nửa chữ
     cut = s.rfind(" ")
     if cut <= 0:
         return s
@@ -27,12 +26,7 @@ class Stabilized:
 
 
 class SimpleStabilizer:
-    """
-    Stabilizer kiểu LCP nhưng:
-    - chỉ commit khi LCP đủ dài
-    - commit theo word-boundary (tránh "Hoàn to")
-    - nếu stable không còn là prefix của new_text => reset stable
-    """
+
 
     def __init__(self, min_chars: int = 18):
         self.min_chars = int(min_chars)
@@ -46,12 +40,10 @@ class SimpleStabilizer:
             self._prev = ""
             return Stabilized(stable=self._stable, partial="")
 
-        # lần đầu
         if not self._prev:
             self._prev = new_text
             return Stabilized(stable=self._stable, partial=new_text)
 
-        # nếu stable hiện tại không còn match prefix nữa => reset (tránh lệch)
         if self._stable and not new_text.startswith(self._stable):
             self._stable = ""
 

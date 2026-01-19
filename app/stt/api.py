@@ -1,7 +1,7 @@
 import os
 import logging
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.stt.manager import SessionManager, StartSessionRequest
@@ -74,18 +74,10 @@ async def list_sessions():
     return manager.list()
 
 
-@router.websocket("/v1/ws/{session_id}")
-async def ws_captions(ws: WebSocket, session_id: str):
-    await ws.accept()
-    queue = manager.subscribe(session_id)
-    if queue is None:
-        await ws.close(code=1008)
-        return
-    try:
-        while True:
-            msg = await queue.get()
-            await ws.send_json(msg)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.unsubscribe(session_id, queue)
+@router.get("/v1/sessions/{session_id}/transcript")
+async def get_transcript(session_id: str):
+    transcript = manager.get_transcript(session_id)
+    if transcript is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return transcript
+
