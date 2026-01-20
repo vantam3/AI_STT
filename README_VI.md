@@ -1,4 +1,4 @@
-# stt-vietsub-service
+﻿# stt-vietsub-service
 
 Dịch vụ STT tiếng Việt realtime-ish sử dụng **faster-whisper**.  
 Service nhận audio (RTP/Opus từ **Janus** hoặc **URL**) → decode về PCM → nhận dạng giọng nói → trả text streaming (partial/commit/final).
@@ -20,11 +20,19 @@ pip install -e .
 python run.py
 ```
 
+Lưu ý: `python run.py` sẽ tự load `.env` (qua `python-dotenv`).
+
 Service chạy tại:
 - `http://localhost:9000`
 
 
 ## 2) Biến môi trường (Environment Variables)
+
+Bắt buộc:
+- `BACKEND_URL`
+- `AI_KEY`
+- `RTP_HOST`
+- `RTP_PORT_MIN`, `RTP_PORT_MAX`
 
 Common:
 - `HOST`, `PORT`: địa chỉ bind (mặc định `0.0.0.0:9000`)
