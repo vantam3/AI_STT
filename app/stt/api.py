@@ -1,22 +1,22 @@
-import os
 import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.stt.manager import SessionManager, StartSessionRequest
+from app.config import settings
 
 
 router = APIRouter()
 logging.getLogger("stt")
 
-DEVICE = os.getenv("DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
-DEFAULT_MODEL_SIZE = os.getenv("DEFAULT_MODEL_SIZE", "small")
-MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "4"))
-RTP_HOST = os.getenv("RTP_HOST")
-RTP_PORT_MIN = int(os.getenv("RTP_PORT_MIN", "40000"))
-RTP_PORT_MAX = int(os.getenv("RTP_PORT_MAX", "49999"))
+DEVICE = settings.DEVICE
+COMPUTE_TYPE = settings.COMPUTE_TYPE
+DEFAULT_MODEL_SIZE = settings.DEFAULT_MODEL_SIZE
+MAX_SESSIONS = settings.MAX_SESSIONS
+RTP_HOST = settings.RTP_HOST
+RTP_PORT_MIN = settings.RTP_PORT_MIN
+RTP_PORT_MAX = settings.RTP_PORT_MAX
 
 manager = SessionManager(
     device=DEVICE,
@@ -36,7 +36,7 @@ async def start_session(req: StartSessionRequest):
         rtp_port = None
         payload_type = None
         if req.input.type == "janus_rtp_opus":
-            rtp_host = RTP_HOST or "10.103.100.233"
+            rtp_host = RTP_HOST
             rtp_port = req.input.audio_port
             payload_type = 111
             logging.getLogger("stt").info(
@@ -80,4 +80,3 @@ async def get_transcript(session_id: str):
     if transcript is None:
         raise HTTPException(status_code=404, detail="session not found")
     return transcript
-

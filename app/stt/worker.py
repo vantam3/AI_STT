@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 import wave
 from typing import Optional, Callable, Awaitable
@@ -15,6 +14,7 @@ from app.stt.streaming.buffer import AudioBuffer
 from app.stt.streaming.gate import SpeechGate
 from app.stt.streaming.dedupe import TextDedupe
 from app.stt.streaming.agreement import LocalAgreement
+from app.config import settings
 
 
 class CaptionEvent(BaseModel):
@@ -68,7 +68,7 @@ class STTWorker:
         self.vad_filter = vad_filter
 
   
-        self.beam_size = int(os.getenv("STT_BEAM_SIZE", str(beam_size or 1)) or "1")
+        self.beam_size = int(beam_size)
 
 
         self.window_seconds = window_seconds
@@ -92,17 +92,17 @@ class STTWorker:
         self._sr = 16000
         self._bytes_per_sec = self._sr * 2  # mono int16
 
-        max_seconds = float(os.getenv("STT_BUFFER_SECONDS", "8.0") or "8.0")
+        max_seconds = settings.STT_BUFFER_SECONDS
         buffer_capacity = max_seconds * 5.0
         self._buffer = AudioBuffer(sample_rate=self._sr, max_seconds=buffer_capacity)
 
         self._gate = SpeechGate(
-            rms_threshold=float(os.getenv("STT_RMS_THRESHOLD", "0.005") or "0.005"),
-            min_speech_seconds=float(os.getenv("STT_MIN_SPEECH_SECONDS", "0.2") or "0.2"),
-            min_speech_ratio=float(os.getenv("STT_MIN_SPEECH_RATIO", "0.15") or "0.15"),
+            rms_threshold=settings.STT_RMS_THRESHOLD,
+            min_speech_seconds=settings.STT_MIN_SPEECH_SECONDS,
+            min_speech_ratio=settings.STT_MIN_SPEECH_RATIO,
         )
 
-        stable_min_chars = int(os.getenv("STT_STABLE_MIN_CHARS", "6") or "6")
+        stable_min_chars = settings.STT_STABLE_MIN_CHARS
         self._stabilizer = SimpleStabilizer(min_chars=stable_min_chars)
         self._dedupe = TextDedupe()
         self._agreement = LocalAgreement(min_hits=agreement_hits)
@@ -118,7 +118,7 @@ class STTWorker:
         self._last_voice_ts = time.time()
         self._ingest_bytes = 0
         self._ingest_start = time.time()
-        self._partial_char_limit = int(os.getenv("STT_PARTIAL_CHAR_LIMIT", "220") or "220")
+        self._partial_char_limit = settings.STT_PARTIAL_CHAR_LIMIT
 
         self._utterance_id = 1
         self._current_committed_text = ""
@@ -130,13 +130,15 @@ class STTWorker:
         self._last_proc_ms = 0.0
 
 
-        self._window_seconds = self._coalesce_window_seconds()
-        self._emit_interval_ms = self._coalesce_emit_interval_ms()
-        self._overlap_seconds = self._coalesce_overlap_seconds(self._window_seconds, self._emit_interval_ms)
-        self._silence_seconds = self._coalesce_silence_seconds()
+        self._window_seconds = self._coalesce_window_seconds(window_seconds)
+        self._emit_interval_ms = self._coalesce_emit_interval_ms(emit_interval_ms)
+        self._overlap_seconds = self._coalesce_overlap_seconds(
+            self._window_seconds, self._emit_interval_ms, overlap_seconds
+        )
+        self._silence_seconds = self._coalesce_silence_seconds(silence_seconds)
 
-        self._lag_drop_seconds = float(os.getenv("STT_LAG_DROP_SECONDS", "3.0") or "3.0")
-        self._lag_keep_seconds = float(os.getenv("STT_LAG_KEEP_SECONDS", "1.5") or "1.5")
+        self._lag_drop_seconds = settings.STT_LAG_DROP_SECONDS
+        self._lag_keep_seconds = settings.STT_LAG_KEEP_SECONDS
 
         self._skip_windows = 0
         self._last_ff_sample = 0
@@ -225,7 +227,7 @@ class STTWorker:
         return i
 
     def _build_prompt(self) -> Optional[str]:
-        prompt_chars = int(os.getenv("STT_PROMPT_CHARS", "240") or "240")
+        prompt_chars = settings.STT_PROMPT_CHARS
         if self._prompt_cooldown > 0:
             return None
         txt = (self._current_committed_text or self._final_emitted_text or "").strip()
@@ -233,50 +235,26 @@ class STTWorker:
             return None
         return txt[-prompt_chars:] if len(txt) > prompt_chars else txt
 
-    def _coalesce_window_seconds(self) -> float:
-        v = os.getenv("STT_WINDOW_SECONDS")
-        if v:
-            try:
-                return float(v)
-            except Exception:
-                pass
-        if self.window_seconds and self.window_seconds > 0:
-            return float(self.window_seconds)
-        return 4.0
+    def _coalesce_window_seconds(self, value: float) -> float:
+        if value and value > 0:
+            return float(value)
+        raise ValueError("window_seconds must be > 0")
 
-    def _coalesce_emit_interval_ms(self) -> int:
-        v = os.getenv("STT_EMIT_INTERVAL_MS")
-        if v:
-            try:
-                return int(float(v))
-            except Exception:
-                pass
-        if self.emit_interval_ms and self.emit_interval_ms > 0:
-            return int(self.emit_interval_ms)
-        return 400
+    def _coalesce_emit_interval_ms(self, value: int) -> int:
+        if value and value > 0:
+            return int(value)
+        raise ValueError("emit_interval_ms must be > 0")
 
-    def _coalesce_overlap_seconds(self, window_seconds: float, emit_interval_ms: int) -> float:
-        v = os.getenv("STT_OVERLAP_SECONDS")
-        if v:
-            try:
-                ov = float(v)
-                return min(max(0.0, ov), max(0.0, window_seconds - 0.05))
-            except Exception:
-                pass
-        if self.overlap_seconds and self.overlap_seconds > 0:
-            return min(float(self.overlap_seconds), max(0.0, window_seconds - 0.05))
-        return min(1.0, max(0.0, window_seconds - 0.05))
+    def _coalesce_overlap_seconds(
+        self, window_seconds: float, emit_interval_ms: int, value: float
+    ) -> float:
+        ov = float(value)
+        return min(max(0.0, ov), max(0.0, window_seconds - 0.05))
 
-    def _coalesce_silence_seconds(self) -> float:
-        v = os.getenv("STT_SILENCE_SECONDS")
-        if v:
-            try:
-                return float(v)
-            except Exception:
-                pass
-        if self.silence_seconds and self.silence_seconds > 0:
-            return float(self.silence_seconds)
-        return 0.8
+    def _coalesce_silence_seconds(self, value: float) -> float:
+        if value is None or value < 0:
+            raise ValueError("silence_seconds must be >= 0")
+        return float(value)
 
     def _fast_forward_cursor(self, target_end_sample: int, reason: str, logger, extra: str = "") -> None:
         if target_end_sample <= self._end_sample:
@@ -358,7 +336,7 @@ class STTWorker:
         self._playout_ref_sample = 0
 
         async def _ingest_loop():
-            if os.getenv("STT_DUMP_FULL", "0") == "1":
+            if settings.STT_DUMP_FULL:
                 self._dump_path = f"stt_dump_{self.session_id}.wav"
                 self._dump_wave = wave.open(self._dump_path, "wb")
                 self._dump_wave.setnchannels(1)
@@ -435,7 +413,7 @@ class STTWorker:
                 audio_bytes, win_start_sample, t1 = win
                 win_sec = len(audio_bytes) / self._bytes_per_sec
 
-                min_win = float(os.getenv("STT_MIN_WINDOW_SECONDS", "2.0") or "2.0")
+                min_win = settings.STT_MIN_WINDOW_SECONDS
                 if win_sec < min_win:
                     continue
 

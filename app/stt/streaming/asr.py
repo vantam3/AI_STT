@@ -1,10 +1,10 @@
 import logging
-import os
 import threading
 from typing import Dict, Optional, Tuple
 
 from faster_whisper import WhisperModel
 
+from app.config import settings
 
 class FasterWhisperASR:
     _models: Dict[Tuple[str, str, str], WhisperModel] = {}
@@ -23,8 +23,8 @@ class FasterWhisperASR:
             if model is None:
                 logging.getLogger("stt").info("loading model=%s device=%s compute_type=%s", *key)
 
-                cpu_threads = int(os.getenv("STT_CPU_THREADS", "0") or "0")
-                num_workers = int(os.getenv("STT_NUM_WORKERS", "1") or "1")
+                cpu_threads = settings.STT_CPU_THREADS
+                num_workers = settings.STT_NUM_WORKERS
 
                 kwargs = {}
                 if cpu_threads > 0:
@@ -45,11 +45,11 @@ class FasterWhisperASR:
     def transcribe(self, audio, vad_filter: bool, beam_size: int, prompt: Optional[str] = None):
         model = self._load_model()
 
-        no_speech_threshold = float(os.getenv("STT_NO_SPEECH_THRESHOLD", "0.70") or "0.70")
-        log_prob_threshold = float(os.getenv("STT_LOGPROB_THRESHOLD", "-1.0") or "-1.0")
-        compression_ratio_threshold = float(os.getenv("STT_COMPRESSION_RATIO_THRESHOLD", "2.4") or "2.4")
+        no_speech_threshold = settings.STT_NO_SPEECH_THRESHOLD
+        log_prob_threshold = settings.STT_LOGPROB_THRESHOLD
+        compression_ratio_threshold = settings.STT_COMPRESSION_RATIO_THRESHOLD
 
-        condition_on_previous_text = os.getenv("STT_CONDITION_ON_PREV_TEXT", "1") != "0"
+        condition_on_previous_text = settings.STT_CONDITION_ON_PREV_TEXT
 
         return model.transcribe(
             audio,

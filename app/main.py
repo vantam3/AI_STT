@@ -1,4 +1,3 @@
-import os
 import logging
 import numpy as np
 from fastapi import FastAPI
@@ -6,6 +5,7 @@ from fastapi import FastAPI
 from app.stt.api import router as stt_router
 from app.stt.api import manager
 from app.stt.streaming.asr import FasterWhisperASR
+from app.config import settings
 
 app = FastAPI(title="stt-vietsub-service", version="0.1.0")
 logging.basicConfig(level=logging.INFO)
@@ -13,11 +13,11 @@ app.include_router(stt_router)
 
 @app.on_event("startup")
 async def preload_model() -> None:
-    model_size = os.getenv("DEFAULT_MODEL_SIZE", "small")
-    device = os.getenv("DEVICE", "cpu")
-    compute_type = os.getenv("COMPUTE_TYPE", "int8")
-    window_seconds = float(os.getenv("STT_WARMUP_WINDOW_SECONDS", "0.45") or "0.45")
-    warmup_windows = int(os.getenv("STT_WARMUP_WINDOWS", "12") or "12")
+    model_size = settings.DEFAULT_MODEL_SIZE
+    device = settings.DEVICE
+    compute_type = settings.COMPUTE_TYPE
+    window_seconds = settings.STT_WARMUP_WINDOW_SECONDS
+    warmup_windows = settings.STT_WARMUP_WINDOWS
     logging.getLogger("stt").info(
         "preload model=%s device=%s compute_type=%s", model_size, device, compute_type
     )

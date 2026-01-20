@@ -1,11 +1,11 @@
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
+from app.config import settings
 
 @dataclass
 class FFMpegSource:
@@ -30,9 +30,9 @@ def _sdp_for_opus(listen_ip: str, port: int, payload_type: int = 111) -> str:
 
 
 def build_ffmpeg_source(input_cfg) -> tuple[FFMpegSource, str | None]:
-    loglevel = os.getenv("FFMPEG_LOGLEVEL", "error")
-    rtbuf_size = os.getenv("FFMPEG_RTBUF_SIZE")
-    buffer_size = os.getenv("FFMPEG_BUFFER_SIZE")
+    loglevel = settings.FFMPEG_LOGLEVEL
+    rtbuf_size = settings.FFMPEG_RTBUF_SIZE
+    buffer_size = settings.FFMPEG_BUFFER_SIZE
 
     async_filter = "aresample=async=1:first_pts=0"
 
@@ -138,8 +138,8 @@ async def pcm_stream_from_ffmpeg(
 
     last_no_data = 0.0
     last_data_ts = time.time()
-    read_timeout = float(os.getenv("STT_FFMPEG_READ_TIMEOUT", "0.5") or "0.5")
-    idle_timeout = float(os.getenv("STT_RTP_IDLE_MS", "0") or "0") / 1000.0
+    read_timeout = settings.STT_FFMPEG_READ_TIMEOUT
+    idle_timeout = settings.STT_RTP_IDLE_MS / 1000.0
 
     frame_bytes = 640  # 20ms @16k mono s16le
     pending = bytearray()

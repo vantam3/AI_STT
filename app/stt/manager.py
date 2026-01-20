@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import random
 import socket
 import time
@@ -10,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.stt.worker import STTWorker, CaptionEvent
 from app.stt.callbacks import CallbackClient
+from app.config import settings
 
 
 class InputJRTPOpus(BaseModel):
@@ -29,15 +29,15 @@ InputConfig = InputJRTPOpus | InputFFmpegURL
 
 
 class ASRConfig(BaseModel):
-    model_size: Optional[str] = "small"
-    language: Optional[str] = "vi"
-    vad_filter: bool = False
-    beam_size: int = 2
-    window_seconds: float = 1.2
-    overlap_seconds: float = 0.6
-    emit_interval_ms: int = 300
-    agreement_hits: int = 2
-    silence_seconds: float = 1.0
+    model_size: Optional[str] = None
+    language: Optional[str] = None
+    vad_filter: Optional[bool] = None
+    beam_size: Optional[int] = None
+    window_seconds: Optional[float] = None
+    overlap_seconds: Optional[float] = None
+    emit_interval_ms: Optional[int] = None
+    agreement_hits: Optional[int] = None
+    silence_seconds: Optional[float] = None
 
 
 class CallbackConfig(BaseModel):
@@ -192,13 +192,33 @@ class SessionManager:
             session_id = uuid.uuid4().hex
             self._stopping_sessions.discard(session_id)
             model_size = req.asr.model_size or self.default_model_size
+            language = req.asr.language or settings.STT_LANGUAGE
+            vad_filter = (
+                req.asr.vad_filter if req.asr.vad_filter is not None else settings.STT_VAD_FILTER
+            )
+            beam_size = req.asr.beam_size if req.asr.beam_size is not None else settings.STT_BEAM_SIZE
+            window_seconds = (
+                req.asr.window_seconds if req.asr.window_seconds is not None else settings.STT_WINDOW_SECONDS
+            )
+            overlap_seconds = (
+                req.asr.overlap_seconds if req.asr.overlap_seconds is not None else settings.STT_OVERLAP_SECONDS
+            )
+            emit_interval_ms = (
+                req.asr.emit_interval_ms if req.asr.emit_interval_ms is not None else settings.STT_EMIT_INTERVAL_MS
+            )
+            agreement_hits = (
+                req.asr.agreement_hits if req.asr.agreement_hits is not None else settings.STT_AGREEMENT_HITS
+            )
+            silence_seconds = (
+                req.asr.silence_seconds if req.asr.silence_seconds is not None else settings.STT_SILENCE_SECONDS
+            )
 
-            backend_url = os.getenv("BACKEND_URL")
-            if backend_url:
-                backend_url = backend_url.rstrip("/")
-            default_callback_url = f"{backend_url}/janus/api/ai/captions" if backend_url else None
+            backend_url = settings.BACKEND_URL.rstrip("/") if settings.BACKEND_URL else ""
+            default_callback_url = (
+                f"{backend_url}/janus/api/ai/captions" if backend_url else None
+            )
             callback_url = req.callback.url or default_callback_url
-            callback_secret = os.getenv("AI_KEY")
+            callback_secret = settings.AI_KEY or None
             callback_client = CallbackClient(callback_url, callback_secret) if callback_url else None
             if callback_client:
                 await self._ensure_callback_worker()
@@ -220,14 +240,14 @@ class SessionManager:
                 publisher_id=req.publisher_id,
                 input_cfg=req.input,
                 model_size=model_size,
-                language=req.asr.language or "vi",
-                vad_filter=req.asr.vad_filter,
-                beam_size=req.asr.beam_size,
-                window_seconds=req.asr.window_seconds,
-                overlap_seconds=req.asr.overlap_seconds,
-                emit_interval_ms=req.asr.emit_interval_ms,
-                agreement_hits=req.asr.agreement_hits,
-                silence_seconds=req.asr.silence_seconds,
+                language=language,
+                vad_filter=vad_filter,
+                beam_size=beam_size,
+                window_seconds=window_seconds,
+                overlap_seconds=overlap_seconds,
+                emit_interval_ms=emit_interval_ms,
+                agreement_hits=agreement_hits,
+                silence_seconds=silence_seconds,
                 device=self.device,
                 compute_type=self.compute_type,
                 sem=self._sem,

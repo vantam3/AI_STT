@@ -3,11 +3,8 @@ services:
     build: .
     ports:
       - "9000:9000"
-    environment:
-      - DEVICE=cpu
-      - COMPUTE_TYPE=int8
-      - DEFAULT_MODEL_SIZE=small
-      - MAX_SESSIONS=4
+    env_file:
+      - .env
     # Nếu dùng GPU (nvidia), bạn có thể bật:
     # deploy:
     #   resources:
